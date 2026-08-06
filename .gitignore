@@ -1,0 +1,20 @@
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test and temporary output
+*.log
+*.tmp
+coverage/
+dist/

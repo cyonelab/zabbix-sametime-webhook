@@ -1,0 +1,979 @@
+zabbix_export:
+  version: '7.0'
+  media_types:
+    - name: Sametime
+      description: |
+        Sends Zabbix notifications to HCL Sametime 12.0.4.
+
+        Supported destinations:
+        - modern channel: ChannelId or Channel;
+        - standard group chat: GroupPlaceId or Group;
+        - direct message: To.
+
+        Routing priority:
+        ChannelId → Channel → GroupPlaceId → Group → To.
+
+        Required macros: {$ST_URL}, {$ST_USERNAME}, {$ST_PASSWORD}.
+        Optional macros: {$ST_CHANNELID}, {$ST_CHANNEL},
+        {$ST_GROUP_PLACEID}, {$ST_GROUP}, {$ST_PROXY}.
+
+        The technical account must have access to the selected conversation.
+        Publishing to a channel requires the MEMBER or MODERATOR role.
+        Webhook version: 1.0.0.
+      type: WEBHOOK
+      parameters:
+        - name: Channel
+          value: '{$ST_CHANNEL}'
+        - name: ChannelId
+          value: '{$ST_CHANNELID}'
+        - name: Group
+          value: '{$ST_GROUP}'
+        - name: GroupPlaceId
+          value: '{$ST_GROUP_PLACEID}'
+        - name: Host
+          value: '{$ST_URL}'
+        - name: Message
+          value: '{ALERT.MESSAGE}'
+        - name: Password
+          value: '{$ST_PASSWORD}'
+        - name: proxy
+          value: '{$ST_PROXY}'
+        - name: Subject
+          value: '{ALERT.SUBJECT}'
+        - name: To
+          value: '{ALERT.SENDTO}'
+        - name: Username
+          value: '{$ST_USERNAME}'
+      script: |
+        /*
+         * HCL Sametime Webhook for Zabbix
+         * Script version: 1.0.0
+         * Target: Zabbix 7.x Webhook JavaScript runtime, HCL Sametime 12.0.4
+         *
+         * Version history:
+         * 1.0.0 - Initial public release.
+         */
+
+        var Sametime = {
+            scriptName: "HCL Sametime Zabbix Webhook",
+            scriptVersion: "1.0.0",
+            targetSametimeApi: "12.0.4",
+
+            host: null,
+            username: null,
+            password: null,
+            to: null,          // Direct chat userId.
+            placeid: null,     // Existing n-way group chat PlaceId.
+            topic: null,       // N-way group chat name used to find PlaceId.
+            channelid: null,   // Sametime 12.0.4 Chatrooms service channel ID.
+            channel: null,     // Sametime 12.0.4 channel name.
+            message: null,
+            proxy: null,
+
+            rtcNonce: null,    // CSRF token returned by /stwebapi/user/connect.
+            cookies: "",       // Cookie header value: "k=v; k2=v2".
+            sid: null,         // Sametime session id used by RTCServlet.
+            apiCsrfToken: null,// CSRF token returned by /sametime-auth/api/v1/check.
+
+            // ---------- helpers ----------
+            _log: function (msg) {
+                Zabbix.log(4, "[Sametime Webhook v" + this.scriptVersion + "] " + msg);
+            },
+
+            _maskCookies: function (cookies) {
+                if (!cookies) {
+                    return "<none>";
+                }
+                return String(cookies).replace(/=([^;]+)/g, "=<VALUE>");
+            },
+
+            _encodeForm: function (params) {
+                var out = [];
+                for (var k in params) {
+                    if (params[k] !== undefined && params[k] !== null) {
+                        out.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(params[k])));
+                    }
+                }
+                return out.join("&");
+            },
+
+            _extractCookiesFromHeaders: function (headersObj) {
+                var setCookie = null;
+                var list = [];
+                var i;
+                var k;
+
+                if (!headersObj) {
+                    this._log("No headers object received");
+                    return;
+                }
+
+                // Zabbix can return header keys in different letter cases.
+                setCookie = headersObj["Set-Cookie"] || headersObj["set-cookie"] || headersObj["SET-COOKIE"];
+
+                if (!setCookie) {
+                    for (k in headersObj) {
+                        if (String(k).toLowerCase() === "set-cookie") {
+                            setCookie = headersObj[k];
+                            break;
+                        }
+                    }
+                }
+
+                if (!setCookie) {
+                    this._log("No Set-Cookie header found");
+                    return;
+                }
+
+                // getHeaders(true) usually returns arrays. Keep string handling for compatibility.
+                if (Array.isArray(setCookie)) {
+                    list = setCookie;
+                }
+                else if (typeof setCookie === "string") {
+                    list = setCookie.split(/\r?\n/);
+                }
+                else {
+                    list = [String(setCookie)];
+                }
+
+                // Merge new cookies with previously collected cookies.
+                var cookieMap = {};
+
+                if (this.cookies) {
+                    var existing = this.cookies.split(/;\s*/);
+                    for (i = 0; i < existing.length; i++) {
+                        var existingPair = existing[i].split("=");
+                        if (existingPair.length >= 2) {
+                            cookieMap[existingPair[0]] = existingPair.slice(1).join("=");
+                        }
+                    }
+                }
+
+                // Keep only the cookie name=value part before the first semicolon.
+                for (i = 0; i < list.length; i++) {
+                    var s = String(list[i]).trim();
+                    if (!s) {
+                        continue;
+                    }
+                    var m = s.match(/^\s*([^=;\s]+)=([^;]*)/);
+                    if (m) {
+                        cookieMap[m[1]] = m[2];
+                    }
+                }
+
+                var pairs = [];
+                for (k in cookieMap) {
+                    pairs.push(k + "=" + cookieMap[k]);
+                }
+
+                this.cookies = pairs.join("; ");
+                this._log("Collected cookies: " + this._maskCookies(this.cookies));
+            },
+
+            _collectCookiesFromRequest: function (request, stageName) {
+                try {
+                    var headers = request.getHeaders(true) || {};
+                    this._extractCookiesFromHeaders(headers);
+                    this._log(stageName + " response cookies collected");
+                }
+                catch (e) {
+                    this._log(stageName + " getHeaders(true) failed: " + e);
+                }
+            },
+
+            _applyCommonHeaders: function (request) {
+                request.addHeader("Content-Type: application/x-www-form-urlencoded;charset=UTF-8");
+
+                if (this.cookies) {
+                    request.addHeader("Cookie: " + this.cookies);
+                }
+
+                if (this.rtcNonce) {
+                    // Sametime documentation uses both header spellings in different places.
+                    request.addHeader("Rtc4web-Nonce: " + this.rtcNonce);
+                    request.addHeader("Rtc4Web-Nonce: " + this.rtcNonce);
+                }
+
+                if (this.proxy) {
+                    request.setProxy(this.proxy);
+                }
+            },
+
+            _getResponseHeader: function (request, wantedName) {
+                var headers = request.getHeaders(true) || {};
+                var wanted = String(wantedName).toLowerCase();
+                var k;
+                var value;
+
+                for (k in headers) {
+                    if (String(k).toLowerCase() === wanted) {
+                        value = headers[k];
+                        if (Array.isArray(value)) {
+                            return value.length ? String(value[0]) : null;
+                        }
+                        return value === undefined || value === null ? null : String(value);
+                    }
+                }
+
+                return null;
+            },
+
+            _applyChatroomsHeaders: function (request, contentType) {
+                request.addHeader("Accept: application/json");
+                request.addHeader("Content-Type: " + (contentType || "application/json"));
+
+                if (this.cookies) {
+                    request.addHeader("Cookie: " + this.cookies);
+                }
+
+                if (this.apiCsrfToken) {
+                    request.addHeader("X-CSRF-Token: " + this.apiCsrfToken);
+                }
+
+                if (this.proxy) {
+                    request.setProxy(this.proxy);
+                }
+            },
+
+            _parseJson: function (text) {
+                try {
+                    return JSON.parse(text);
+                }
+                catch (e) {
+                    return null;
+                }
+            },
+
+            _normalize: function (s) {
+                if (s === undefined || s === null) {
+                    return "";
+                }
+                return String(s).replace(/^\s+|\s+$/g, "").toLowerCase();
+            },
+
+            _optional: function (s) {
+                var value;
+
+                if (s === undefined || s === null) {
+                    return null;
+                }
+
+                value = String(s).replace(/^\s+|\s+$/g, "");
+
+                // An undefined Zabbix user macro can reach a webhook unchanged.
+                if (!value || /^\{\$[^}]+\}$/.test(value)) {
+                    return null;
+                }
+
+                return value;
+            },
+
+            _findPlaceIdRecursive: function (obj, wantedTopic) {
+                if (obj === null || obj === undefined) {
+                    return null;
+                }
+
+                if (Array.isArray(obj)) {
+                    for (var i = 0; i < obj.length; i++) {
+                        var r = this._findPlaceIdRecursive(obj[i], wantedTopic);
+                        if (r) {
+                            return r;
+                        }
+                    }
+                    return null;
+                }
+
+                if (typeof obj === "object") {
+                    var names = [obj.topic, obj.name, obj.displayName, obj.title, obj.subject];
+                    var place = obj.placeid || obj.placeId || obj.plcId || obj.placeID || obj.with || obj.id || null;
+
+                    for (var j = 0; j < names.length; j++) {
+                        if (this._normalize(names[j]) === wantedTopic && place) {
+                            return place;
+                        }
+                    }
+
+                    for (var k in obj) {
+                        var rr = this._findPlaceIdRecursive(obj[k], wantedTopic);
+                        if (rr) {
+                            return rr;
+                        }
+                    }
+                }
+
+                return null;
+            },
+
+            // ---------- Sametime API calls ----------
+            login: function () {
+                var req = new HttpRequest();
+
+                if (this.proxy) {
+                    req.setProxy(this.proxy);
+                }
+
+                var url = this.host.replace(/\/+$/, "") +
+                    "/stwebapi/user/connect?username=" + encodeURIComponent(this.username) +
+                    "&password=" + encodeURIComponent(this.password);
+
+                this._log("Script: " + this.scriptName + " v" + this.scriptVersion + ", target Sametime API " + this.targetSametimeApi);
+                this._log("Login URL: " + url.replace(encodeURIComponent(this.password), "<PASS>"));
+
+                // Credentials are passed in the query string according to Sametime Chat REST API.
+                var resp = req.post(url, "");
+                var code = req.getStatus();
+
+                this._log("Login HTTP code: " + code);
+
+                // Sametime 12.0.4 can establish both Chat REST and Chatrooms API
+                // authentication in this request. In that case it returns
+                // sametimeJwt/sametimeRefresh cookies and x-csrf-token.
+                this.apiCsrfToken = this._getResponseHeader(req, "x-csrf-token");
+                this._collectCookiesFromRequest(req, "Login");
+
+                var json = this._parseJson(resp);
+
+                if (code !== 200 || !json) {
+                    throw "Login failed (HTTP " + code + ")";
+                }
+
+                this.rtcNonce = json.rtc4webNonce || json.rtc4WebNonce || json.nonce || null;
+                this.sid = json.sid || json.sessionId || json.sessionid || null;
+
+                this._log("Collected rtc4webNonce: " + (this.rtcNonce ? "yes" : "no"));
+                this._log("Collected sid: " + (this.sid ? "yes" : "no"));
+                this._log("Collected Chatrooms API CSRF token: " + (this.apiCsrfToken ? "yes" : "no"));
+
+                if (!this.rtcNonce) {
+                    throw "No rtc4webNonce in login response";
+                }
+            },
+
+            handshake: function () {
+                var req;
+                var url;
+                var resp;
+                var code;
+
+                // This lightweight call can refresh the current web session state.
+                try {
+                    req = new HttpRequest();
+                    this._applyCommonHeaders(req);
+
+                    url = this.host.replace(/\/+$/, "") + "/stwebapi/connectweb/loggedin";
+                    this._log("Handshake GET " + url);
+
+                    resp = req.get(url);
+                    code = req.getStatus();
+
+                    this._log("Handshake connectweb HTTP code: " + code);
+                    this._collectCookiesFromRequest(req, "Handshake connectweb");
+                }
+                catch (e1) {
+                    this._log("Handshake connectweb warning: " + e1);
+                }
+
+                // Join the RTC stream when a session id is available.
+                if (this.sid) {
+                    try {
+                        req = new HttpRequest();
+                        this._applyCommonHeaders(req);
+
+                        url = this.host.replace(/\/+$/, "") +
+                            "/stwebapi/RTCServlet/" + encodeURIComponent(this.sid) + "/user";
+
+                        this._log("Handshake PUT " + url);
+
+                        resp = req.put(url, "");
+                        code = req.getStatus();
+
+                        this._log("Handshake RTCServlet join HTTP code: " + code);
+                        this._collectCookiesFromRequest(req, "Handshake RTCServlet");
+                    }
+                    catch (e2) {
+                        this._log("Handshake RTCServlet warning: " + e2);
+                    }
+                }
+            },
+
+            loginChatroomsApi: function () {
+                if (this.apiCsrfToken) {
+                    this._log("Reusing Chatrooms API session established by Chat REST login");
+                    return;
+                }
+
+                var req = new HttpRequest();
+                var url = this.host.replace(/\/+$/, "") + "/sametime-auth/api/v1/check";
+                var resp;
+                var code;
+
+                req.addHeader("Accept: application/json");
+
+                if (this.cookies) {
+                    req.addHeader("Cookie: " + this.cookies);
+                }
+
+                if (this.proxy) {
+                    req.setProxy(this.proxy);
+                }
+
+                // /check validates the sametimeJwt cookie established by
+                // /stwebapi/user/connect and returns x-csrf-token on HTTP 200.
+                this._log("Chatrooms session check GET " + url);
+
+                resp = req.get(url);
+                code = req.getStatus();
+
+                this._log("Chatrooms session check HTTP code: " + code);
+                this.apiCsrfToken = this._getResponseHeader(req, "x-csrf-token");
+                this._collectCookiesFromRequest(req, "Chatrooms session check");
+
+                // If the access token expired but the refresh cookie is still
+                // valid, exchange it for a fresh JWT and CSRF token.
+                if (code === 401) {
+                    req = new HttpRequest();
+                    url = this.host.replace(/\/+$/, "") + "/sametime-auth/api/v1/refresh";
+
+                    req.addHeader("Accept: application/json");
+                    if (this.cookies) {
+                        req.addHeader("Cookie: " + this.cookies);
+                    }
+                    if (this.proxy) {
+                        req.setProxy(this.proxy);
+                    }
+
+                    this._log("Chatrooms session refresh GET " + url);
+                    resp = req.get(url);
+                    code = req.getStatus();
+
+                    this._log("Chatrooms session refresh HTTP code: " + code);
+                    this.apiCsrfToken = this._getResponseHeader(req, "x-csrf-token");
+                    this._collectCookiesFromRequest(req, "Chatrooms session refresh");
+                }
+
+                if (code !== 200) {
+                    throw "Chatrooms session validation failed (HTTP " + code + ")";
+                }
+
+                if (!this.apiCsrfToken) {
+                    throw "Chatrooms session validation failed: no x-csrf-token response header";
+                }
+
+                this._log("Chatrooms API CSRF token collected");
+            },
+
+            _chatroomFromResponse: function (resp, operationName) {
+                var json = this._parseJson(resp);
+                var room;
+
+                if (!json) {
+                    throw operationName + " failed: response is not valid JSON";
+                }
+
+                room = json.chatroom || json.data || json.result || json;
+
+                // Keep compatibility with undocumented response variants.
+                room.id = room.id || room._id || room.chatroomId || room.channelId || null;
+
+                if (!room.placeId && !room.placeid) {
+                    throw operationName + " failed: channel has no placeId";
+                }
+
+                return room;
+            },
+
+            findChannelIdInList: function (channelName) {
+                var page;
+                var req;
+                var url;
+                var resp;
+                var code;
+                var json;
+                var rooms;
+                var i;
+                var id;
+                var wanted = this._normalize(channelName);
+
+                // /byName in some 12.0.4 builds omits id even though the OpenAPI
+                // Chatroom schema declares it. The paginated list returns
+                // ChatroomResult objects that include the channel id.
+                for (page = 0; page < 20; page++) {
+                    req = new HttpRequest();
+                    this._applyChatroomsHeaders(req, "application/json");
+
+                    url = this.host.replace(/\/+$/, "") +
+                        "/sametime-chatrooms/api/v1/chatrooms?pageNumber=" + page +
+                        "&pageSize=100&includePending=false";
+
+                    this._log("FindChannelIdInList GET page " + page);
+                    resp = req.get(url);
+                    code = req.getStatus();
+
+                    this._log("FindChannelIdInList HTTP code: " + code);
+                    this._collectCookiesFromRequest(req, "FindChannelIdInList");
+
+                    if (code !== 200) {
+                        throw "FindChannelIdInList failed (HTTP " + code + ")";
+                    }
+
+                    json = this._parseJson(resp);
+                    if (!json) {
+                        throw "FindChannelIdInList failed: response is not valid JSON";
+                    }
+
+                    rooms = Array.isArray(json) ? json :
+                        (json.results || json.chatrooms || json.data || []);
+
+                    if (!Array.isArray(rooms)) {
+                        throw "FindChannelIdInList failed: no channel results array";
+                    }
+
+                    for (i = 0; i < rooms.length; i++) {
+                        if (this._normalize(rooms[i].name) === wanted) {
+                            id = rooms[i].id || rooms[i]._id ||
+                                rooms[i].chatroomId || rooms[i].channelId || null;
+                            if (id) {
+                                return String(id);
+                            }
+                        }
+                    }
+
+                    if (!json.nextPage) {
+                        break;
+                    }
+                }
+
+                return null;
+            },
+
+            findChannelPlaceId: function () {
+                var req;
+                var url;
+                var resp;
+                var code;
+                var room;
+
+                this.loginChatroomsApi();
+
+                req = new HttpRequest();
+                this._applyChatroomsHeaders(req, "application/json");
+
+                if (this.channelid) {
+                    url = this.host.replace(/\/+$/, "") +
+                        "/sametime-chatrooms/api/v1/chatrooms/" + encodeURIComponent(this.channelid);
+
+                    this._log("FindChannelById GET " + url);
+                    resp = req.get(url);
+                    code = req.getStatus();
+
+                    this._log("FindChannelById HTTP code: " + code);
+                    this._collectCookiesFromRequest(req, "FindChannelById");
+
+                    if (code !== 200) {
+                        throw "FindChannelById failed (HTTP " + code + ")";
+                    }
+
+                    room = this._chatroomFromResponse(resp, "FindChannelById");
+                    room.id = room.id || this.channelid;
+                }
+                else {
+                    url = this.host.replace(/\/+$/, "") +
+                        "/sametime-chatrooms/api/v1/chatrooms/byName";
+
+                    this._log("FindChannelByName POST " + url);
+                    resp = req.post(url, JSON.stringify({ name: this.channel }));
+                    code = req.getStatus();
+
+                    this._log("FindChannelByName HTTP code: " + code);
+                    this._collectCookiesFromRequest(req, "FindChannelByName");
+
+                    if (code !== 200) {
+                        throw 'FindChannelByName failed for channel "' + this.channel + '" (HTTP ' + code + ")";
+                    }
+
+                    room = this._chatroomFromResponse(resp, "FindChannelByName");
+
+                    if (!room.id) {
+                        try {
+                            room.id = this.findChannelIdInList(room.name || this.channel);
+                        }
+                        catch (idError) {
+                            // ChannelId is useful for configuration, but placeId is
+                            // sufficient for delivery, so do not fail the alert.
+                            this._log("FindChannelIdInList warning: " + idError);
+                        }
+                    }
+                }
+
+                this._log('Resolved channel "' + (room.name || "<unnamed>") +
+                    '", ChannelId: ' + (room.id || "<not returned>") +
+                    ", PlaceId: " + (room.placeId || room.placeid));
+
+                return room.placeId || room.placeid;
+            },
+
+            findPlaceIdByTopic: function (topic) {
+                if (!topic) {
+                    throw 'Parameter "Topic" is empty';
+                }
+
+                var req = new HttpRequest();
+                this._applyCommonHeaders(req);
+
+                // Returns conversations visible to the currently logged-in user.
+                var url = this.host.replace(/\/+$/, "") +
+                    "/stwebapi/convomap/conversations?maxSize=200&isolated=true";
+
+                this._log("FindPlaceId URL: " + url);
+
+                var resp = req.get(url);
+                var code = req.getStatus();
+
+                this._log("FindPlaceId HTTP code: " + code);
+                this._collectCookiesFromRequest(req, "FindPlaceId");
+
+                if (code !== 200) {
+                    throw "FindPlaceId failed (HTTP " + code + ")";
+                }
+
+                var json = this._parseJson(resp);
+
+                if (!json || !json.conversations || !Array.isArray(json.conversations)) {
+                    throw "FindPlaceId failed: no conversations array in response";
+                }
+
+                var wanted = this._normalize(topic);
+                var debugList = [];
+                var i;
+                var j;
+
+                // First pass: exact match on n-way chat display fields.
+                for (i = 0; i < json.conversations.length; i++) {
+                    var c = json.conversations[i];
+
+                    debugList.push({
+                        type: c.type || "",
+                        with: c.with || "",
+                        uid: c.uid || "",
+                        sid: c.sid || "",
+                        name: c.name || "",
+                        displayName: c.displayName || "",
+                        tok: c.tok || ""
+                    });
+
+                    if (c.type !== "NWAY_TEXT") {
+                        continue;
+                    }
+
+                    var candidates = [c.displayName, c.name, c.topic, c.title, c.subject];
+
+                    for (j = 0; j < candidates.length; j++) {
+                        if (this._normalize(candidates[j]) === wanted) {
+                            if (!c.with) {
+                                throw 'NWAY conversation for topic "' + topic + '" found, but field "with" is empty';
+                            }
+                            this._log('Found NWAY PlaceId by topic "' + topic + '": ' + c.with);
+                            return c.with;
+                        }
+                    }
+                }
+
+                // Second pass: partial match on n-way chat display fields.
+                for (i = 0; i < json.conversations.length; i++) {
+                    var c2 = json.conversations[i];
+
+                    if (c2.type !== "NWAY_TEXT") {
+                        continue;
+                    }
+
+                    var partialCandidates = [c2.displayName, c2.name, c2.topic, c2.title, c2.subject];
+
+                    for (j = 0; j < partialCandidates.length; j++) {
+                        var candidate = this._normalize(partialCandidates[j]);
+
+                        if (candidate && candidate.indexOf(wanted) !== -1) {
+                            if (!c2.with) {
+                                throw 'NWAY conversation for topic "' + topic + '" found by partial match, but field "with" is empty';
+                            }
+                            this._log('Found NWAY PlaceId by partial topic "' + topic + '": ' + c2.with);
+                            return c2.with;
+                        }
+                    }
+                }
+
+                this._log("Available conversations: " + JSON.stringify(debugList));
+                throw 'PlaceId not found for Topic "' + topic + '". The logged-in Sametime user may not be a member of this n-way chat.';
+            },
+
+            findPlaceIdInInvitationsByTopic: function (topic) {
+                if (!topic) {
+                    throw 'Parameter "Topic" is empty';
+                }
+
+                var req = new HttpRequest();
+                this._applyCommonHeaders(req);
+
+                // Fallback for n-way chats where the user has an invitation but no conversation map entry yet.
+                var url = this.host.replace(/\/+$/, "") + "/stwebapi/nway/invitation";
+                this._log("FindPlaceIdInInvitations URL: " + url);
+
+                var resp = req.get(url);
+                var code = req.getStatus();
+
+                this._log("FindPlaceIdInInvitations HTTP code: " + code);
+                this._collectCookiesFromRequest(req, "FindPlaceIdInInvitations");
+
+                if (code !== 200) {
+                    throw "FindPlaceIdInInvitations failed (HTTP " + code + ")";
+                }
+
+                var json = this._parseJson(resp);
+                var wanted = this._normalize(topic);
+                var found = this._findPlaceIdRecursive(json, wanted);
+
+                if (found) {
+                    this._log('Found PlaceId in invitations by topic "' + topic + '": ' + found);
+                    return found;
+                }
+
+                throw 'PlaceId not found in invitations for Topic "' + topic + '"';
+            },
+
+            enterNWay: function () {
+                if (!this.placeid) {
+                    throw 'Parameter "PlaceId" is required to enter n-way chat';
+                }
+
+                var req = new HttpRequest();
+                this._applyCommonHeaders(req);
+
+                // Sametime requires entering an n-way chat in the current session before sending to it.
+                var url = this.host.replace(/\/+$/, "") + "/stwebapi/chat/nway";
+                var body = this._encodeForm({ placeid: this.placeid });
+
+                this._log("EnterNWay URL: " + url);
+                this._log("EnterNWay Params: " + body);
+
+                var resp = req.post(url, body);
+                var code = req.getStatus();
+
+                this._log("EnterNWay HTTP code: " + code);
+                this._collectCookiesFromRequest(req, "EnterNWay");
+
+                if (code !== 200) {
+                    throw "EnterNWay failed (HTTP " + code + ")";
+                }
+
+                var json = this._parseJson(resp);
+                if (json && json.returnCode && Number(json.returnCode) >= 400) {
+                    throw "EnterNWay failed (returnCode " + json.returnCode + "): " + (json.error || resp);
+                }
+            },
+
+            sendDirect: function () {
+                if (!this.to) {
+                    throw 'Parameter "To" is required for direct chat';
+                }
+
+                var req = new HttpRequest();
+                this._applyCommonHeaders(req);
+
+                var url = this.host.replace(/\/+$/, "") + "/stwebapi/chat";
+                var body = this._encodeForm({
+                    userId: this.to,
+                    msg: this.message || "",
+                    typing: false
+                });
+
+                this._log("SendDirect URL: " + url);
+                this._log("SendDirect cookies: " + this._maskCookies(this.cookies));
+
+                var resp = req.post(url, body);
+                var code = req.getStatus();
+
+                this._log("SendDirect HTTP code: " + code);
+                this._collectCookiesFromRequest(req, "SendDirect");
+
+                if (code !== 200) {
+                    throw "SendDirect failed (HTTP " + code + ")";
+                }
+            },
+
+            sendNWay: function () {
+                if (!this.placeid) {
+                    throw 'Parameter "PlaceId" is required for n-way chat';
+                }
+
+                this.enterNWay();
+
+                var req = new HttpRequest();
+                this._applyCommonHeaders(req);
+
+                var url = this.host.replace(/\/+$/, "") + "/stwebapi/chat/nway";
+                var body = this._encodeForm({
+                    placeid: this.placeid,
+                    msg: this.message || ""
+                });
+
+                this._log("SendNWay URL: " + url);
+                this._log("SendNWay cookies: " + this._maskCookies(this.cookies));
+
+                var resp = req.post(url, body);
+                var code = req.getStatus();
+
+                this._log("SendNWay HTTP code: " + code);
+                this._collectCookiesFromRequest(req, "SendNWay");
+
+                if (code !== 200) {
+                    throw "SendNWay failed (HTTP " + code + ")";
+                }
+
+                var json = this._parseJson(resp);
+                if (json && json.returnCode && Number(json.returnCode) >= 400) {
+                    throw "SendNWay failed (returnCode " + json.returnCode + "): " + (json.error || resp);
+                }
+            },
+
+            logout: function () {
+                try {
+                    var req = new HttpRequest();
+                    this._applyCommonHeaders(req);
+
+                    var url = this.host.replace(/\/+$/, "") + "/stwebapi/user/connect";
+                    this._log("Logout DELETE " + url);
+
+                    var resp = req.delete(url);
+                    var code = req.getStatus();
+
+                    this._log("Logout HTTP code: " + code);
+                    this._log("Logout body: " + resp);
+                }
+                catch (e) {
+                    this._log("Logout warning: " + e);
+                }
+            }
+        };
+
+        // ------------- entry point -------------
+        try {
+            var p = JSON.parse(value);
+
+            if (!p.Host) {
+                throw 'Incorrect value is given for parameter "Host": parameter is missing';
+            }
+            if (!p.Username) {
+                throw 'Incorrect value is given for parameter "Username": parameter is missing';
+            }
+            if (!p.Password) {
+                throw 'Incorrect value is given for parameter "Password": parameter is missing';
+            }
+            Sametime.host = p.Host;
+            Sametime.username = p.Username;
+            Sametime.password = p.Password;
+            Sametime.to = Sametime._optional(p.To);
+            // Prefer the new names, but accept the legacy parameter names when
+            // only the script was updated in an existing Zabbix media type.
+            Sametime.placeid = Sametime._optional(p.GroupPlaceId) || Sametime._optional(p.PlaceId);
+            Sametime.topic = Sametime._optional(p.Group) || Sametime._optional(p.Topic);
+            Sametime.channelid = Sametime._optional(p.ChannelId);
+            Sametime.channel = Sametime._optional(p.Channel);
+            Sametime.message = (p.Subject ? p.Subject + "\n" : "") + (p.Message || "");
+            Sametime.proxy = Sametime._optional(p.proxy) || Sametime._optional(p.HTTPProxy);
+
+            if (!Sametime.to && !Sametime.placeid && !Sametime.topic &&
+                    !Sametime.channelid && !Sametime.channel) {
+                throw 'Provide "ChannelId"/"Channel", "GroupPlaceId"/"Group", or "To"';
+            }
+
+            // Step 1: authenticate and collect CSRF token and cookies.
+            Sametime.login();
+
+            // Step 2: refresh session state and join the RTC stream when possible.
+            Sametime.handshake();
+
+            // Step 3: Channels have highest routing priority. Resolve their
+            // Chatrooms service ID/name to the PlaceId used by Chat REST API.
+            if (Sametime.channelid || Sametime.channel) {
+                Sametime.placeid = Sametime.findChannelPlaceId();
+            }
+            // Step 4: resolve an ordinary n-way group chat PlaceId by Group name.
+            else if (!Sametime.placeid && Sametime.topic) {
+                try {
+                    Sametime.placeid = Sametime.findPlaceIdByTopic(Sametime.topic);
+                }
+                catch (e1) {
+                    Sametime._log("FindPlaceIdByTopic failed: " + e1);
+                    Sametime.placeid = Sametime.findPlaceIdInInvitationsByTopic(Sametime.topic);
+                }
+            }
+
+            // Step 5: send the message.
+            if (Sametime.placeid) {
+                Sametime.sendNWay();
+            }
+            else {
+                Sametime.sendDirect();
+            }
+
+            // Optional: explicitly close the Sametime session.
+            // Sametime.logout();
+
+            return "OK";
+        }
+        catch (error) {
+            Zabbix.log(4, "[Sametime Webhook] notification failed: " + error);
+            throw "Sending failed: " + error + ".";
+        }
+      timeout: 20s
+      message_templates:
+        - event_source: TRIGGERS
+          operation_mode: PROBLEM
+          subject: '{EVENT.NAME}'
+          message: |
+            Problem started at {EVENT.TIME} on {EVENT.DATE}
+            Problem name: {EVENT.NAME}
+            Host: {HOST.NAME}
+            Severity: {EVENT.SEVERITY}
+            Operational data: {EVENT.OPDATA}
+            Original problem ID: {EVENT.ID}
+            {TRIGGER.URL}
+        - event_source: TRIGGERS
+          operation_mode: RECOVERY
+          subject: 'Resolved in {EVENT.DURATION}: {EVENT.NAME}'
+          message: |
+            Problem has been resolved in {EVENT.DURATION} at {EVENT.RECOVERY.TIME} on {EVENT.RECOVERY.DATE}
+            Problem name: {EVENT.NAME}
+            Host: {HOST.NAME}
+            Severity: {EVENT.SEVERITY}
+            Original problem ID: {EVENT.ID}
+            {TRIGGER.URL}
+        - event_source: TRIGGERS
+          operation_mode: UPDATE
+          subject: 'Updated problem: {EVENT.NAME}'
+          message: |
+            {USER.FULLNAME} {EVENT.UPDATE.ACTION} problem at {EVENT.UPDATE.DATE} {EVENT.UPDATE.TIME}.
+            {EVENT.UPDATE.MESSAGE}
+
+            Current problem status is {EVENT.STATUS}, acknowledged: {EVENT.ACK.STATUS}.
+        - event_source: DISCOVERY
+          operation_mode: PROBLEM
+          subject: 'Discovery: {DISCOVERY.DEVICE.STATUS} {DISCOVERY.DEVICE.IPADDRESS}'
+          message: |
+            Discovery rule: {DISCOVERY.RULE.NAME}
+
+            Device IP: {DISCOVERY.DEVICE.IPADDRESS}
+            Device DNS: {DISCOVERY.DEVICE.DNS}
+            Device status: {DISCOVERY.DEVICE.STATUS}
+            Device uptime: {DISCOVERY.DEVICE.UPTIME}
+
+            Device service name: {DISCOVERY.SERVICE.NAME}
+            Device service port: {DISCOVERY.SERVICE.PORT}
+            Device service status: {DISCOVERY.SERVICE.STATUS}
+            Device service uptime: {DISCOVERY.SERVICE.UPTIME}
+        - event_source: AUTOREGISTRATION
+          operation_mode: PROBLEM
+          subject: 'Autoregistration: {HOST.HOST}'
+          message: |
+            Host name: {HOST.HOST}
+            Host IP: {HOST.IP}
+            Agent port: {HOST.PORT}

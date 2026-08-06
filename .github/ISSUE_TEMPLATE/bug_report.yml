@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a reproducible webhook problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Do not include credentials, cookies, tokens, private hostnames, user IDs, channel IDs, PlaceIds, customer data, or alert contents.
+  - type: input
+    id: webhook-version
+    attributes:
+      label: Webhook version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: zabbix-version
+    attributes:
+      label: Zabbix version
+      placeholder: "7.0.x"
+    validations:
+      required: true
+  - type: input
+    id: sametime-version
+    attributes:
+      label: HCL Sametime version
+      placeholder: "12.0.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: destination
+    attributes:
+      label: Destination type
+      options:
+        - Direct user
+        - Standard group chat
+        - Channel
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Sanitized Zabbix webhook log
+      description: Replace every private value with an explicit placeholder before submitting.
+      render: text
